@@ -82,6 +82,18 @@ namespace quantas {
             inst->data[key] = val;
         }
 
+        static json snapshot() {
+            LogWriter* inst = instance();
+            std::lock_guard<std::mutex> lock(inst->_mutex);
+            return inst->data;
+        }
+
+        static void clear() {
+            LogWriter* inst = instance();
+            std::lock_guard<std::mutex> lock(inst->_mutex);
+            inst->data.clear();
+        }
+
     private:
         std::ofstream _file_stream;
         std::ostream* _log_stream = nullptr;

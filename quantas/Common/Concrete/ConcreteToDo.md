@@ -1,170 +1,205 @@
-Absolutely — here's a clear, developer-friendly **✅ TODO list** based on the 9 suggestions, along with more detailed guidance on **reliability and safety** concerns so you know exactly what to tackle and why.
+# Concrete Mode Unification Plan
 
----
+Goal: make a file such as quantas/KademliaPeer/KademliaPeerInput.json mean the same thing in abstract and concrete mode without modifying any application directory and without changing abstract-mode code.
 
-## ✅ **TO-DO List** (Based on Suggestions)
+Non-goals for the first pass:
+- Do not rename or edit any files under quantas/*Peer.
+- Do not change quantas/Common/Abstract.
+- Do not try to make application-specific end-of-round aggregation fully identical yet.
 
-### 🔁 1. Use **Persistent TCP Connections**
-**Goal:** Only connect to each peer once and reuse that connection.
+## Target behavior
 
-**How:**
-- Create a `PeerConnection` or `ConnectionManager` class.
-- Store a persistent `int socket_fd` for each peer.
-- Modify `send_json()` to:
-  - Check if a socket exists and is connected
-  - Otherwise, establish and store the connection
+The same experiment JSON must drive both runtimes:
+- algorithms stays the compilation list.
+- experiments[n].topology stays the topology source of truth.
+- experiments[n].parameters stays the peer configuration payload.
+- experiments[n].topology.initialPeerType stays the peer type name in both runtimes.
 
-📝 *Avoids cost of connect/close per message.*
+Concrete mode should differ only in transport and process model:
+- abstract mode: one process, many peers, in-memory channels.
+- concrete mode: many processes, one active peer per process, TCP transport.
 
----
+## Current blockers in the concrete path
 
-### 🧵 2. Push **accept() handling to thread pool**
-**Goal:** Don’t block listener loop waiting on slow connections.
+1. quantas/Common/Concrete/concreteSimulation.cpp hardcodes AltBitPeerConcrete instead of reading topology.initialPeerType.
+2. quantas/Common/Concrete/NetworkInterfaceConcrete.hpp bootstraps from a leader config that does not understand the experiment JSON.
+3. Concrete mode builds a complete graph by discovery instead of respecting the experiment topology.
+4. Some peer initialization code expects a vector containing all peers, not just the local one.
+5. End-of-round metrics are often computed by iterating over every peer instance, which cannot be reproduced exactly without application cooperation.
 
-**How:**
-- Inside `start_listener()`:
-  ```cpp
-  int client_fd = accept(...);
-  pool.push_task([=] { handle_connection(client_fd); });
-  ```
-- Move message handling from inside the loop to a new `handle_connection()` function.
+## Refactor plan
 
-📝 *Improves scalability and responsiveness under load.*
+### Phase 1: Shared experiment parsing in concrete mode
 
----
+Add a concrete-only experiment loader under quantas/Common/Concrete that:
+- reads the same input JSON file used by abstract mode;
+- selects one experiment by index;
+- exposes:
+  - algorithms;
+  - topology;
+  - parameters;
+  - distribution;
+  - rounds;
+  - tests.
 
-### 🔌 3. Modularize Message Handling
-**Goal:** Make message processing logic extensible and maintainable.
+Suggested files:
+- quantas/Common/Concrete/ConcreteExperiment.hpp
+- quantas/Common/Concrete/ConcreteTopologyPlan.hpp
 
-**How:**
-- Declare:
-  ```cpp
-  std::unordered_map<std::string, std::function<void(const json&)>> handlers;
-  ```
-- Register handlers for `"ip_report"`, `"ip_list"`, `"message"`, etc.
-- In your loop:
-  ```cpp
-  if (handlers.contains(type)) handlers[type](msg);
-  ```
+The loader must not depend on quantas/Common/Abstract.
 
-📝 *Cleaner than `if-else-if` chains and easier to expand.*
+### Phase 2: Rebuild topology logic locally in the concrete runtime
 
----
+Copy the topology semantics from abstract mode into a concrete-only planner.
 
-### 🧱 4. Add a `PeerChannelManager` Layer
-**Goal:** Cleanly manage per-peer persistent connections and their states.
+Supported topology types must match abstract mode:
+- complete
+- star
+- grid
+- torus
+- chain
+- ring
+- unidirectionalRing
+- userList
 
-**How:**
-- Create a new class to:
-  - Track `interfaceId → socket_fd`
-  - Queue messages if disconnected
-  - Attempt reconnection if broken
-- Use this inside `unicastTo()` instead of calling `send_json()` directly
+Implementation rule:
+- the planner returns an ordered list of public ids and an adjacency list keyed by public id.
 
-📝 *Separates connection logic from protocol logic.*
+Important detail:
+- if topology.identifiers == random, the leader must generate the randomized public-id order once and distribute it to every process.
+- do not try to infer the same random order independently on each process.
 
----
+### Phase 3: Separate bootstrap config from experiment config
 
-### 📊 5. Add **Message Stats / Logging**
-**Goal:** Track messages sent, received, retries, failed sends.
+Concrete mode should use two inputs:
+- experiment JSON: the same file as abstract mode;
+- bootstrap JSON or CLI arguments: only deployment details such as leader ip, leader port, and optional local port.
 
-**How:**
-- Add counters (e.g. `std::atomic<int> sent_messages`) or use `LogWriter::pushValue("stats", {...})`
-- Print stats periodically or on shutdown
+Bootstrap data must not redefine:
+- total_peers
+- topology
+- peer type
+- parameters
 
-📝 *Useful for performance tuning and debugging.*
+Those values must come from the experiment JSON only.
 
----
+### Phase 4: Replace full-mesh neighbor discovery with topology assignment
 
-### ⚠️ 6. Improve Error Checking on Socket Ops
-**Goal:** Detect and diagnose hidden network bugs.
+Change the leader protocol in quantas/Common/Concrete/NetworkInterfaceConcrete.hpp:
+- keep peer discovery to learn ip and port of each process;
+- assign each process a public id;
+- send every process:
+  - the full public-id to endpoint map;
+  - the public-id order used by topology;
+  - its own public id.
 
-**Checklist:**
-- ✅ `setsockopt()` → check return code
-- ✅ `bind()` → check and throw on failure (you already do!)
-- ✅ `send()` → check return value (`if (bytes_sent < 0)`)
-- ✅ `recv()` / `read()` → handle `EINTR`, `EAGAIN`, `bytes == 0`
-- ❌ Avoid swallowing exceptions in `catch (...)` — at least log them
+After bootstrap, each process must compute its own neighbor set from the shared topology plan and call addNeighbor only for those peers.
 
-📝 *Improves safety, reliability, and log transparency.*
+Current behavior to remove:
+- adding every discovered peer as a neighbor.
 
----
+### Phase 5: Instantiate peers by the same name as abstract mode
 
-### 🔍 7. Log Malformed or Invalid JSON
-**Goal:** Don’t silently ignore bad data.
+Concrete mode must stop relying on names such as AltBitPeerConcrete.
 
-**How:**
-```cpp
-catch (const std::exception& e) {
-    std::cerr << "[JSON ERROR] " << e.what() << " Raw: " << raw_msg << "\n";
-}
-```
+Add a concrete-only factory under quantas/Common/Concrete that maps the abstract peer name to a constructor using NetworkInterfaceConcrete.
 
-📝 *Helps debug malformed packets or protocol mismatches.*
+Suggested file:
+- quantas/Common/Concrete/ConcretePeerFactory.hpp
 
----
+Example contract:
+- input: KademliaPeer
+- output: new KademliaPeer(new NetworkInterfaceConcrete())
 
-### 🧽 8. Clean Up Includes
-**Goal:** Slim down the file and improve clarity.
+This keeps the meaning of topology.initialPeerType unchanged.
 
-**How:**
-- Remove unused headers like `<deque>`, `<algorithm>` if not used.
-- Consider creating a common `socket_util.hpp` for shared TCP code.
+### Phase 6: Create shadow peers for initParameters
 
----
+Many peer implementations configure themselves by iterating over the full peer vector during initParameters.
+Because application code cannot be changed, each concrete process should create:
+- one active local peer with NetworkInterfaceConcrete;
+- N-1 shadow peers of the same concrete type with a no-op interface.
 
-### 🔄 9. Use an RAII Wrapper for Sockets
-**Goal:** Avoid manually closing sockets in every branch.
+The shadow peers only need:
+- stable public ids;
+- neighbor sets derived from the shared topology plan.
 
-**How:**
-```cpp
-class ScopedSocket {
-public:
-    explicit ScopedSocket(int fd) : fd(fd) {}
-    ~ScopedSocket() {
-        if (fd >= 0) close(fd);
-    }
-    int fd;
-};
-```
-Use:
-```cpp
-ScopedSocket sock(accept(...));
-```
+Suggested file:
+- quantas/Common/Concrete/NullNetworkInterface.hpp
 
-📝 *Reduces bugs and ensures sockets always close cleanly.*
+Then the concrete runtime can call localPeer->initParameters(allPeers, parameters) with the same shape as abstract mode.
 
----
+This is enough to preserve initialization semantics for:
+- committee construction;
+- all-peer parameter fanout;
+- fault attachment by index;
+- DHT id bookkeeping.
 
-## 🔒 Reliability & Safety – In Detail
+### Phase 7: Keep the concrete event loop generic
 
-### 🔥 Why These Matter
+Rewrite quantas/Common/Concrete/concreteSimulation.cpp so that it:
+- parses the shared experiment file;
+- chooses the peer type from experiments[n].topology.initialPeerType;
+- constructs the active peer via ConcretePeerFactory;
+- constructs shadow peers via NullNetworkInterface;
+- calls initParameters with the full peer vector;
+- runs only the active peer in the local receive/compute loop.
 
-**In a distributed simulation**, one bad socket or missed error check can:
-- Cause peer hangs
-- Fail silently on message delivery
-- Delay reconnections
-- Leave ports stuck in `TIME_WAIT` or `CLOSE_WAIT`
+The loop must no longer hardcode AltBit behavior.
 
-### 🚨 Key Issues and Fixes
+### Phase 8: Update the concrete makefile to compile the same algorithms list
 
-| Issue | Risk | Fix |
-|-------|------|-----|
-| `bind()` fails | Port can't be reused → hangs | ✅ Already fixed by throwing |
-| `send()` fails silently | Messages lost, peer unaware | Log and reconnect socket |
-| `recv() == 0` | Peer closed connection | Clean up or reconnect |
-| Swallowed exception in `catch (...)` | All errors ignored | Log with `what()` and message dump |
-| No retry limit in `connect()` | Infinite retry loops | Add timeout or max attempts |
-| All logic in main loop | Spaghetti bugs, hard to trace | Move logic to handler map or dispatcher |
-| No backpressure | Flooded queues, memory growth | Track pending tasks and slow sender |
+The concrete build should mirror the root makefile behavior for algorithms:
+- parse the algorithms array from INPUTFILE;
+- compile those translation units;
+- link them into the concrete executable together with the concrete runtime files.
 
----
+This keeps the meaning of each application directory unchanged:
+- if the experiment uses quantas/KademliaPeer/KademliaPeerInput.json, concrete mode compiles KademliaPeer/KademliaPeer.cpp.
 
-## ✅ Final Notes
+### Phase 9: Preserve message semantics incrementally
 
-You’ve already built a solid foundation — these steps will:
-- Improve robustness and observability
-- Future-proof the architecture
-- Make it easier to scale to 10s or 100s of nodes
+Topology and peer selection should be unified first.
+After that, move concrete transport closer to abstract distribution semantics.
 
-Let me know if you'd like me to scaffold out any of these (e.g., persistent `PeerConnectionManager`, message dispatcher, socket RAII utility) — I’d be happy to help you implement it cleanly.
+Priority order:
+1. support delay;
+2. support dropProbability;
+3. support duplicateProbability;
+4. support reorderProbability;
+5. support queue size and maxMsgsRec.
+
+These belong in quantas/Common/Concrete/NetworkInterfaceConcrete.hpp or a new concrete channel helper.
+
+## Known limitation that cannot be solved generically under the current constraints
+
+Exact end-of-round metrics cannot be guaranteed without changing application code.
+
+Reason:
+- many peers compute final metrics by iterating over all live peer objects and reading application-specific local state;
+- in concrete mode, only one live peer exists per process;
+- shadow peers do not evolve with remote state.
+
+Acceptable first-pass behavior:
+- unify experiment meaning, topology, peer selection, and initialization;
+- document that final aggregated metrics remain concrete-mode-specific until a generic snapshot or metrics API exists.
+
+## Concrete implementation order
+
+1. Add ConcreteExperiment and ConcreteTopologyPlan helpers.
+2. Add ConcretePeerFactory using the existing peer headers.
+3. Add NullNetworkInterface for shadow peers.
+4. Refactor NetworkInterfaceConcrete bootstrap to assign public ids and stop full-mesh neighbor registration.
+5. Refactor concreteSimulation.cpp to use the same experiment file and peer type name as abstract mode.
+6. Update concrete/makefile to compile algorithms from INPUTFILE.
+7. Validate AltBit, StableDataLink, Kademlia, and ExamplePeer end-to-end in concrete mode.
+8. Add transport-level delay/drop/duplicate behavior.
+
+## Validation checklist
+
+- Same INPUTFILE path works in abstract and concrete mode.
+- Same topology.initialPeerType value works in abstract and concrete mode.
+- Concrete neighbors match the topology generated from the experiment JSON.
+- initParameters sees a full peer vector in concrete mode.
+- No code under quantas/*Peer is modified.
+- No code under quantas/Common/Abstract is modified.

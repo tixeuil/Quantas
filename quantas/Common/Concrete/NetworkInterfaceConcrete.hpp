@@ -3,17 +3,24 @@
 
 #include <memory>
 #include <map>
+#include <atomic>
 #include <set>
 #include <deque>
+#include <vector>
 #include <string>
+#include <climits>
 #include <algorithm>
 #include <mutex>
-#include <condition_variable>
 #include <iostream>
 #include <fstream>
 #include "../LogWriter.hpp"
 #include "../Packet.hpp"
 #include "../NetworkInterface.hpp"
+#include "../RandomUtil.hpp"
+#include "ConcreteBootstrap.hpp"
+#include "ConcreteExperiment.hpp"
+#include "ConcreteLoggerClient.hpp"
+#include "ConcreteTopologyPlan.hpp"
 #include "ipUtil.hpp"
 #include "../Json.hpp"
 #include "../BS_thread_pool.hpp"
@@ -38,20 +45,109 @@ public:
 
 class NetworkInterfaceConcrete : public NetworkInterface {
 private:
+    struct ConcreteDistributionProperties {
+        double dropProbability = 0.0;
+        double reorderProbability = 0.0;
+        double duplicateProbability = 0.0;
+        int maxMsgsRec = 1;
+        int size = INT_MAX;
+        int avgDelay = 1;
+        int minDelay = 1;
+        int maxDelay = 1;
+        std::string type = "UNIFORM";
+
+        void setParameters(const json& params) {
+            dropProbability = params.value("dropProbability", 0.0);
+            reorderProbability = params.value("reorderProbability", 0.0);
+            duplicateProbability = params.value("duplicateProbability", 0.0);
+            maxMsgsRec = params.value("maxMsgsRec", 1);
+            size = params.value("size", INT_MAX);
+            avgDelay = params.value("avgDelay", 1);
+            minDelay = params.value("minDelay", 1);
+            maxDelay = params.value("maxDelay", 1);
+            type = params.value("type", std::string("UNIFORM"));
+        }
+
+        int computeDelay() const {
+            if (type == "POISSON") {
+                int delay = poissonInt(avgDelay);
+                return std::clamp(delay, minDelay, maxDelay);
+            }
+            if (type == "ONE") {
+                return 1;
+            }
+            return uniformInt(minDelay, maxDelay);
+        }
+    };
 
     int my_port = -1;
     int total_peers = -1;
-    bool is_leader = false;
     std::atomic<bool> shutdown_condition = false;
     int server_fd = -1;
     std::string my_ip;
-    json config;
+    ConcreteBootstrapConfig bootstrap;
+    ConcreteTopologyPlan topologyPlan;
 
     std::mutex concrete_mtx;
     std::thread listener; // the thread for receiving messages
     BS::thread_pool pool{1}; // currently only 1 thread is allowed to exist for sending messages
 
     std::map<interfaceId, NeighborInfo> all_peers;
+    ConcreteDistributionProperties distribution;
+    int throughput_left = INT_MAX;
+    std::deque<Packet> channel_queue;
+    std::mutex channel_mtx;
+
+    void configure_distribution(const json& distributionParams) {
+        distribution.setParameters(distributionParams);
+        int roundsLeft = static_cast<int>(RoundManager::lastRound() - RoundManager::currentRound());
+        if (roundsLeft < 1) {
+            roundsLeft = 1;
+        }
+        throughput_left = distribution.maxMsgsRec * roundsLeft;
+    }
+
+    bool can_queue_packet_locked() const {
+        return throughput_left != 0 && static_cast<int>(channel_queue.size()) < distribution.size;
+    }
+
+    void consume_throughput_locked() {
+        if (throughput_left > 0) {
+            --throughput_left;
+        }
+    }
+
+    void enqueue_received_message(interfaceId sender, const json& body) {
+        std::lock_guard<std::mutex> channelLock(channel_mtx);
+        if (trueWithProbability(distribution.dropProbability)) {
+            return;
+        }
+
+        bool duplicate = false;
+        do {
+            duplicate = false;
+            if (!can_queue_packet_locked()) {
+                return;
+            }
+
+            consume_throughput_locked();
+
+            Packet packet(_publicId, sender, body);
+            const int delay = distribution.computeDelay();
+            packet.setDelay(delay, delay);
+            channel_queue.push_back(std::move(packet));
+
+            duplicate = trueWithProbability(distribution.duplicateProbability);
+        } while (duplicate);
+    }
+
+    void apply_topology_neighbors() {
+        _neighbors.clear();
+        for (interfaceId neighbor : topologyPlan.neighborsFor(_publicId)) {
+            addNeighbor(neighbor);
+        }
+    }
+
     // Use a thread pool or message dispatch queue so you don’t spawn hundreds of threads.
     void send_json(const std::string& ip, int port, const json& jmsg, bool async = true) {
         auto task = [=]() {
@@ -90,23 +186,15 @@ private:
         }
     }
 
-    void send_ip_report() {
-        json msg = {
-            {"type", "ip_report"},
-            {"from_ip", my_ip},
-            {"from_id", -1},
-            {"from_port", my_port},
-            {"to_ids", {config["leader"]["id"]}},
-            {"id_count", 1}
-        };
-        send_json(config["leader"]["ip"], config["leader"]["port"], msg);
+    void send_registration() {
+        ConcreteLoggerClient::sendRegistration(bootstrap, my_ip, my_port);
     }
 
     void wait_for_peer_list() {
         while (true) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             std::lock_guard<std::mutex> lock(concrete_mtx);
-            if (all_peers.size() == total_peers) break;
+            if (all_peers.size() == static_cast<size_t>(total_peers) && _publicId != NO_PEER_ID) break;
         }
     }
 
@@ -180,50 +268,22 @@ private:
                 json msg = json::parse(raw_msg);
                 std::string type = msg.value("type", "");                
 
-                if (type == "ip_report" && is_leader) {
-                    std::string assigned_ip = msg["from_ip"];
-                    int port = msg["from_port"];
+                if (type == "peer_assignment") {
                     std::lock_guard<std::mutex> lock(concrete_mtx);
-                    interfaceId assigned_id = all_peers.size() + 1;
-                    all_peers.insert({assigned_id, {assigned_id, assigned_ip, port}});
-
-                    if (all_peers.size() == total_peers - 1) {
-                        all_peers.insert({_publicId, {_publicId, my_ip, my_port}});
-                        json all_peers_json;
-                        for (const auto& peer : all_peers) {
-                            all_peers_json["peers"].push_back(peer.second.jsonify());
-                        }
-
-                        json newMsg = {
-                            {"type", "ip_list"},
-                            {"from_id", _publicId},
-                            {"peers", all_peers_json["peers"]}
-                        };
-
-                        for (const auto& peer : all_peers) {
-                            if (peer.first == _publicId) continue;
-                            addNeighbor(peer.first);
-                            send_json(peer.second.ip, peer.second.port, newMsg);
-                        }
-                    }
-                } else if (type == "ip_list" && !is_leader) {
-                    std::lock_guard<std::mutex> lock(concrete_mtx);
+                    topologyPlan = ConcreteTopologyPlan::fromJson(msg.value("topologyPlan", json::object()));
+                    all_peers.clear();
                     for (const auto& item : msg["peers"]) {
                         NeighborInfo newNeighbor(item["id"], item["ip"], item["port"]);
                         all_peers.insert({item["id"], newNeighbor});
                         if (item["ip"] == my_ip && item["port"] == my_port) {
                             _publicId = item["id"];
-                        } else {
-                            addNeighbor(item["id"]);
                         }
                     }
+                    apply_topology_neighbors();
                 } else if (type == "message") {
-                    std::lock_guard<std::mutex> lock(_inStream_mtx);
                     interfaceId sender = msg.value("from_id", -1);
                     if (sender == -1) continue;
-                    Packet arrivedPkt(_publicId, sender, msg["body"]);
-                    _inStream.push_back(std::move(arrivedPkt));
-                    // std::cout << "Message of type | " << type << " | " << std::endl;
+                    enqueue_received_message(sender, msg["body"]);
                 }
             } catch (...) {}
             #ifdef _WIN32
@@ -251,13 +311,9 @@ private:
         install_socket_safety();
 
         listener = std::thread(&NetworkInterfaceConcrete::start_listener, this);
-        
-        if (!is_leader) {
-            send_ip_report();
-            wait_for_peer_list();
-        } else {
-            wait_for_peer_list();
-        }
+
+        send_registration();
+        wait_for_peer_list();
 
         LogWriter::setLogFile("peer_" + std::to_string(_publicId) + ".log");
         LogWriter::setTest(0);
@@ -272,6 +328,14 @@ public:
 
     bool getShutdownCondition() const {
         return shutdown_condition;
+    }
+
+    const ConcreteTopologyPlan& getTopologyPlan() const {
+        return topologyPlan;
+    }
+
+    const ConcreteBootstrapConfig& getBootstrapConfig() const {
+        return bootstrap;
     }
 
     void shutDown() {
@@ -299,17 +363,18 @@ public:
         }
     }
 
-    void load_config(std::string config_path, int port = -1) {
+    void load_config(const ConcreteExperiment& experiment, const std::string& bootstrapPath, int port = -1) {
         my_ip = get_local_ip();
-        std::ifstream in(config_path);
-        in >> config;
-        total_peers = config["total_peers"];
+        bootstrap = ConcreteBootstrapConfig::load(bootstrapPath);
+        topologyPlan = ConcreteTopologyPlan::fromTopology(experiment.topology());
+        total_peers = experiment.initialPeers();
+
+        if (total_peers <= 0) {
+            throw std::runtime_error("Concrete experiment requires topology.initialPeers > 0.");
+        }
+
         if (port == -1) {
             my_port = get_unused_port();
-        } else if (my_ip == config["leader"]["ip"] && port == config["leader"]["port"]) {
-            my_port = port;
-            is_leader = true;
-            _publicId = config["leader"]["id"];
         } else {
             my_port = port;
         }
@@ -317,35 +382,48 @@ public:
         if (!can_bind_port(my_port)) {
             throw std::runtime_error("Failed to bind to port " + std::to_string(my_port));
         }
-
-        in.close();
         start();
     }
 
     // Send messages to to others using this
     inline void unicastTo (json msg, const interfaceId& dest) override;
     
-    // no need to move from channels to instream
-    // moves msgs from the channel to the inStream if they've arrived
-    inline void receive() override {};
+    inline void receive() override {
+        std::vector<Packet> delivered;
+        {
+            std::lock_guard<std::mutex> channelLock(channel_mtx);
+            if (channel_queue.size() > 1 && trueWithProbability(distribution.reorderProbability)) {
+                std::shuffle(channel_queue.begin(), channel_queue.end(), threadLocalEngine());
+            }
+
+            int deliveredCount = 0;
+            while (!channel_queue.empty() && channel_queue.front().hasArrived() && deliveredCount < distribution.maxMsgsRec) {
+                delivered.push_back(std::move(channel_queue.front()));
+                channel_queue.pop_front();
+                ++deliveredCount;
+            }
+        }
+
+        if (!delivered.empty()) {
+            std::lock_guard<std::mutex> streamLock(_inStream_mtx);
+            for (Packet& packet : delivered) {
+                _inStream.push_back(std::move(packet));
+            }
+        }
+    };
 
     inline void clearAll() override {
-        std::cout << "ClearAll" << std::endl;
         #ifdef _WIN32
             WSACleanup();
         #endif
-        listener.join();
-        std::cout << "join" << std::endl;
-        std::size_t task_count = pool.get_tasks_total();
-        std::cout << "Total active or queued tasks: " << task_count << std::endl;
+        if (listener.joinable()) {
+            listener.join();
+        }
         pool.wait_for_tasks();
-        std::cout << "wait_for_tasks" << std::endl;
         _inStream.clear();
-        std::cout << "_inStream" << std::endl;
         _neighbors.clear();
-        std::cout << "_neighbors" << std::endl;
         all_peers.clear();
-        std::cout << "all_peers" << std::endl;
+        channel_queue.clear();
     }
 };
 

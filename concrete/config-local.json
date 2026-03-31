@@ -1,0 +1,11 @@
+{
+  "leader": {
+    "ip": "127.0.0.1",
+    "port": 5000
+  },
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5001,
+    "output": "concrete-aggregate.json"
+  }
+}
