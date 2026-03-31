@@ -36,6 +36,37 @@ Clone the repository, pick the algorithm/input configuration you want to exercis
    ```
    Use `make debug` for an unoptimised build with extra assertions, or `make run_memory` / `make run_debug` for valgrind and gdb helpers.
 
+## Building and Comparing the Concrete Runtime
+
+The concrete runtime lives under [concrete/makefile](concrete/makefile) and now tracks the selected `INPUTFILE` automatically. Switching from one application family to another triggers recompilation of the shared concrete runtime objects, so you no longer need to delete `concreteSimulation.o` or `concreteLogger.o` by hand.
+
+- Build one concrete application explicitly with a dedicated target, for example:
+  ```sh
+  cd concrete
+  make release-bitcoin
+  make release-raft
+  ```
+- Run the concrete helper target directly if you want the default logger/bootstrap flow:
+  ```sh
+  cd concrete
+  make run-kademlia
+  ```
+- Prepare a single-experiment abstract config and compare it with a concrete aggregate:
+  ```sh
+  cd concrete
+  make prepare-abstract-config \
+    INPUTFILE=../quantas/PBFTPeer/PBFTInput.json \
+    OUTPUTFILE=/tmp/pbft-abstract-input.json \
+    LOGFILE=../pbft-abstract-aggregate.json
+
+  make compare-aggregates \
+    ABSTRACT=../pbft-abstract-aggregate.json \
+    CONCRETE=../pbft-concrete-aggregate.json \
+    REPORT=/tmp/pbft-compare.json
+  ```
+
+The comparison helper is implemented in [concrete/aggregate_tools.py](concrete/aggregate_tools.py). It can both prepare reduced abstract inputs for one experiment and compare the structure of two aggregate JSON files.
+
 ## Simulation Input Reference
 
 A simulation is described by a JSON document with two top-level keys:

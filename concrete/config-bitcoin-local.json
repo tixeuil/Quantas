@@ -1,0 +1,8 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5305,
+    "output": "bitcoin-concrete-aggregate.json",
+    "detailsOutput": "bitcoin-concrete-aggregate-details.json"
+  }
+}

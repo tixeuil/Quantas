@@ -1,205 +1,298 @@
-# Concrete Mode Unification Plan
+# Concrete Mode Unification Status
 
 Goal: make a file such as quantas/KademliaPeer/KademliaPeerInput.json mean the same thing in abstract and concrete mode without modifying any application directory and without changing abstract-mode code.
 
-Non-goals for the first pass:
-- Do not rename or edit any files under quantas/*Peer.
-- Do not change quantas/Common/Abstract.
-- Do not try to make application-specific end-of-round aggregation fully identical yet.
+This document is no longer a proposal. It describes the concrete runtime as it exists now, what has been validated, and what remains open.
 
-## Target behavior
+## Invariants kept
 
-The same experiment JSON must drive both runtimes:
-- algorithms stays the compilation list.
-- experiments[n].topology stays the topology source of truth.
-- experiments[n].parameters stays the peer configuration payload.
-- experiments[n].topology.initialPeerType stays the peer type name in both runtimes.
+- No file under quantas/*Peer was modified to make concrete mode work.
+- No file under quantas/Common/Abstract was modified.
+- The same experiment JSON drives both runtimes.
+- experiments[n].topology.initialPeerType keeps the same meaning in both runtimes.
+- experiments[n].parameters keeps the same meaning in both runtimes.
+- experiments[n].topology remains the topology source of truth in both runtimes.
 
-Concrete mode should differ only in transport and process model:
-- abstract mode: one process, many peers, in-memory channels.
-- concrete mode: many processes, one active peer per process, TCP transport.
+## Runtime model now implemented
 
-## Current blockers in the concrete path
+Abstract mode and concrete mode differ only in transport and process model.
 
-1. quantas/Common/Concrete/concreteSimulation.cpp hardcodes AltBitPeerConcrete instead of reading topology.initialPeerType.
-2. quantas/Common/Concrete/NetworkInterfaceConcrete.hpp bootstraps from a leader config that does not understand the experiment JSON.
-3. Concrete mode builds a complete graph by discovery instead of respecting the experiment topology.
-4. Some peer initialization code expects a vector containing all peers, not just the local one.
-5. End-of-round metrics are often computed by iterating over every peer instance, which cannot be reproduced exactly without application cooperation.
+- abstract mode: one process, many peer objects, in-memory channels.
+- concrete mode: one active peer per process, many OS processes, TCP transport, central logger for bootstrap and aggregation.
 
-## Refactor plan
+The concrete runtime no longer hardcodes any application-specific peer type.
 
-### Phase 1: Shared experiment parsing in concrete mode
+## Concrete architecture implemented
 
-Add a concrete-only experiment loader under quantas/Common/Concrete that:
-- reads the same input JSON file used by abstract mode;
-- selects one experiment by index;
-- exposes:
-  - algorithms;
-  - topology;
-  - parameters;
-  - distribution;
-  - rounds;
-  - tests.
+### Shared experiment parsing
 
-Suggested files:
+Implemented in:
 - quantas/Common/Concrete/ConcreteExperiment.hpp
+
+Current behavior:
+- loads the same INPUTFILE JSON used by abstract mode;
+- selects one experiment by index;
+- exposes topology, parameters, distribution, rounds, tests, and input file metadata;
+- does not depend on quantas/Common/Abstract.
+
+### Topology reconstruction in concrete mode
+
+Implemented in:
 - quantas/Common/Concrete/ConcreteTopologyPlan.hpp
 
-The loader must not depend on quantas/Common/Abstract.
+Current behavior:
+- reconstructs the topology locally from the experiment JSON;
+- distributes one shared topology plan to all peers through the logger bootstrap protocol;
+- supports the same topology family intended by the abstract configuration path;
+- preserves identifier assignment centrally so concrete peers do not invent their own public-id ordering.
 
-### Phase 2: Rebuild topology logic locally in the concrete runtime
+### Bootstrap split from experiment config
 
-Copy the topology semantics from abstract mode into a concrete-only planner.
+Implemented in:
+- quantas/Common/Concrete/ConcreteBootstrap.hpp
 
-Supported topology types must match abstract mode:
-- complete
-- star
-- grid
-- torus
-- chain
-- ring
-- unidirectionalRing
-- userList
+Concrete mode now consumes two inputs:
+- experiment JSON: same meaning as abstract mode;
+- bootstrap JSON: deployment-only details.
 
-Implementation rule:
-- the planner returns an ordered list of public ids and an adjacency list keyed by public id.
+Bootstrap currently contains:
+- logger ip;
+- logger port;
+- aggregate output path;
+- detailed output path.
 
-Important detail:
-- if topology.identifiers == random, the leader must generate the randomized public-id order once and distribute it to every process.
-- do not try to infer the same random order independently on each process.
+Bootstrap no longer defines:
+- peer type;
+- topology;
+- number of peers;
+- parameters.
 
-### Phase 3: Separate bootstrap config from experiment config
+### Logger-centered bootstrap and aggregation
 
-Concrete mode should use two inputs:
-- experiment JSON: the same file as abstract mode;
-- bootstrap JSON or CLI arguments: only deployment details such as leader ip, leader port, and optional local port.
+Implemented in:
+- quantas/Common/Concrete/concreteLogger.cpp
+- quantas/Common/Concrete/ConcreteLoggerProtocol.hpp
+- quantas/Common/Concrete/ConcreteLoggerClient.hpp
 
-Bootstrap data must not redefine:
-- total_peers
-- topology
-- peer type
-- parameters
+The logger is now the central rendezvous for concrete mode.
 
-Those values must come from the experiment JSON only.
+Current responsibilities:
+- receive peer registrations;
+- assign public ids;
+- distribute the full endpoint map and topology plan;
+- collect final peer reports;
+- write two output files:
+  - a compact aggregate intended to resemble abstract output;
+  - a detailed file containing peerReports plus embedded aggregate.
 
-### Phase 4: Replace full-mesh neighbor discovery with topology assignment
+Important transport fixes already implemented:
+- read complete socket payloads until EOF instead of assuming one recv/read is enough;
+- send full buffers on both peer and logger side;
+- retry logger connections from peers;
+- use a larger listen backlog in the logger.
 
-Change the leader protocol in quantas/Common/Concrete/NetworkInterfaceConcrete.hpp:
-- keep peer discovery to learn ip and port of each process;
-- assign each process a public id;
-- send every process:
-  - the full public-id to endpoint map;
-  - the public-id order used by topology;
-  - its own public id.
+### Concrete peer factory and shadow peers
 
-After bootstrap, each process must compute its own neighbor set from the shared topology plan and call addNeighbor only for those peers.
-
-Current behavior to remove:
-- adding every discovered peer as a neighbor.
-
-### Phase 5: Instantiate peers by the same name as abstract mode
-
-Concrete mode must stop relying on names such as AltBitPeerConcrete.
-
-Add a concrete-only factory under quantas/Common/Concrete that maps the abstract peer name to a constructor using NetworkInterfaceConcrete.
-
-Suggested file:
+Implemented in:
 - quantas/Common/Concrete/ConcretePeerFactory.hpp
-
-Example contract:
-- input: KademliaPeer
-- output: new KademliaPeer(new NetworkInterfaceConcrete())
-
-This keeps the meaning of topology.initialPeerType unchanged.
-
-### Phase 6: Create shadow peers for initParameters
-
-Many peer implementations configure themselves by iterating over the full peer vector during initParameters.
-Because application code cannot be changed, each concrete process should create:
-- one active local peer with NetworkInterfaceConcrete;
-- N-1 shadow peers of the same concrete type with a no-op interface.
-
-The shadow peers only need:
-- stable public ids;
-- neighbor sets derived from the shared topology plan.
-
-Suggested file:
 - quantas/Common/Concrete/NullNetworkInterface.hpp
 
-Then the concrete runtime can call localPeer->initParameters(allPeers, parameters) with the same shape as abstract mode.
+Current behavior:
+- concrete mode instantiates the same peer type names as abstract mode;
+- each process creates one active peer with NetworkInterfaceConcrete;
+- each process creates shadow peers with NullNetworkInterface so initParameters still sees a full peer vector.
 
-This is enough to preserve initialization semantics for:
+This preserves initialization semantics used by existing applications for:
 - committee construction;
-- all-peer parameter fanout;
-- fault attachment by index;
-- DHT id bookkeeping.
+- per-peer parameter fanout;
+- fault assignment by index;
+- DHT bookkeeping based on peer identity.
 
-### Phase 7: Keep the concrete event loop generic
+### Generic concrete event loop
 
-Rewrite quantas/Common/Concrete/concreteSimulation.cpp so that it:
-- parses the shared experiment file;
-- chooses the peer type from experiments[n].topology.initialPeerType;
+Implemented in:
+- quantas/Common/Concrete/concreteSimulation.cpp
+
+Current behavior:
+- parses the shared experiment JSON;
+- selects the peer type from experiments[n].topology.initialPeerType;
 - constructs the active peer via ConcretePeerFactory;
 - constructs shadow peers via NullNetworkInterface;
 - calls initParameters with the full peer vector;
-- runs only the active peer in the local receive/compute loop.
+- runs receive/compute only on the active peer;
+- uses experiment.rounds() instead of a hardcoded limit;
+- finds the actual active peer at shutdown before sending the final report.
 
-The loop must no longer hardcode AltBit behavior.
+The last point matters for applications like ExamplePeer where the original local peer object can be replaced by another peer object during execution.
 
-### Phase 8: Update the concrete makefile to compile the same algorithms list
+### Concrete transport semantics
 
-The concrete build should mirror the root makefile behavior for algorithms:
-- parse the algorithms array from INPUTFILE;
-- compile those translation units;
-- link them into the concrete executable together with the concrete runtime files.
+Implemented in:
+- quantas/Common/Concrete/NetworkInterfaceConcrete.hpp
 
-This keeps the meaning of each application directory unchanged:
-- if the experiment uses quantas/KademliaPeer/KademliaPeerInput.json, concrete mode compiles KademliaPeer/KademliaPeer.cpp.
+Current behavior approximates abstract distribution semantics locally for incoming concrete messages:
+- delay;
+- dropProbability;
+- duplicateProbability;
+- reorderProbability;
+- queue size;
+- maxMsgsRec.
 
-### Phase 9: Preserve message semantics incrementally
+Concrete neighbors are derived from the shared topology plan, not from full-mesh discovery.
 
-Topology and peer selection should be unified first.
-After that, move concrete transport closer to abstract distribution semantics.
+### Concrete build behavior
 
-Priority order:
-1. support delay;
-2. support dropProbability;
-3. support duplicateProbability;
-4. support reorderProbability;
-5. support queue size and maxMsgsRec.
+Implemented in:
+- concrete/makefile
 
-These belong in quantas/Common/Concrete/NetworkInterfaceConcrete.hpp or a new concrete channel helper.
+Current behavior:
+- parses algorithms from INPUTFILE, like the root build;
+- compiles the corresponding application translation units;
+- rebuilds the shared concrete runtime objects automatically when INPUTFILE changes;
+- exposes per-application helper targets such as release-bitcoin, release-raft, run-kademlia, and similar variants.
 
-## Known limitation that cannot be solved generically under the current constraints
+Important lesson recorded in code:
+- changing only INPUTFILE was previously unsafe because concreteSimulation.o and concreteLogger.o could stay compiled for the previous application family;
+- the current build-context stamp fixes that by invalidating the shared concrete runtime when the selected build context changes.
 
-Exact end-of-round metrics cannot be guaranteed without changing application code.
+### Aggregate preparation and comparison tooling
+
+Implemented in:
+- concrete/aggregate_tools.py
+- concrete/makefile
+
+Current behavior:
+- can prepare a mono-experiment abstract config with an overridden log file;
+- can compare one abstract aggregate against one concrete aggregate;
+- can write a JSON comparison report for inspection.
+
+Helper targets:
+- make prepare-abstract-config
+- make compare-aggregates
+
+## Aggregation behavior now implemented
+
+### Dual concrete outputs
+
+The logger now writes:
+- one compact aggregate file;
+- one detailed file with per-peer reports and the compact aggregate embedded.
+
+Bootstrap examples live under concrete/config-*-local.json.
+
+### Generic reduction path
+
+Implemented in:
+- quantas/Common/Concrete/ConcreteLoggerProtocol.hpp
+
+Current reducer framework supports:
+- scalar sum;
+- scalar max;
+- elementwise sum for numeric arrays;
+- resampled median arrays;
+- raw collection of values.
+
+### Kademlia-specific short-term reduction
+
+Implemented in:
+- quantas/Common/Concrete/ConcreteLoggerProtocol.hpp
+
+Current special handling for Kademlia:
+- kademliaAverageHops and kademliaAverageLatency use resampled median arrays with leading-zero trimming;
+- kademliaRequestsSatisfied uses resampled median arrays without trimming.
+
+This was needed because Kademlia logs global metrics from every peer, so naive summation was structurally wrong.
+
+## Applications validated in concrete mode
+
+Validated end-to-end with compact and detailed outputs:
+- AltBitPeer
+- ExamplePeer
+- StableDataLinkPeer
+- KademliaPeer
+- LinearChordPeer
+- PBFTPeer
+- RaftPeer
+- BitcoinPeer
+- EthereumPeer
+
+Concrete bootstrap files currently present:
+- concrete/config-example-local.json
+- concrete/config-kademlia-local.json
+- concrete/config-stabledatalink-local.json
+- concrete/config-linearchord-local.json
+- concrete/config-pbft-local.json
+- concrete/config-raft-local.json
+- concrete/config-bitcoin-local.json
+- concrete/config-ethereum-local.json
+
+## Abstract versus concrete comparison status
+
+Comparable abstract and concrete aggregates were produced for:
+- Kademlia
+- PBFT
+- Raft
+- Bitcoin
+- Ethereum
+
+Observed patterns:
+- top-level shape now generally matches: tests, RunTime, Peak Memory KB;
+- some applications still differ significantly in per-metric array lengths or value semantics;
+- asynchronous concrete time can produce much denser series than abstract round-based execution;
+- some applications still expose per-peer structures in concrete mode where abstract mode logs a single aggregate summary.
+
+Known examples:
+- Raft concrete output is much denser than abstract output because the application logs against asynchronous currentRound behavior;
+- PBFT concrete output currently has the right metric keys but a much shorter time series shape;
+- Bitcoin and Ethereum keep matching metric names, but some fork-location style metrics remain collected per peer rather than merged into one abstract-like structure.
+
+## Known limitations still open
+
+### Exact end-of-round equivalence is not generic yet
+
+This remains the main unresolved problem.
 
 Reason:
-- many peers compute final metrics by iterating over all live peer objects and reading application-specific local state;
-- in concrete mode, only one live peer exists per process;
-- shadow peers do not evolve with remote state.
+- many applications compute metrics by iterating over all live peer objects and reading local state;
+- in concrete mode, shadow peers preserve initialization semantics but do not evolve with remote runtime state;
+- some applications log once per abstract round, while concrete mode uses asynchronous elapsed-time rounds.
 
-Acceptable first-pass behavior:
-- unify experiment meaning, topology, peer selection, and initialization;
-- document that final aggregated metrics remain concrete-mode-specific until a generic snapshot or metrics API exists.
+Consequence:
+- compact concrete aggregates are often structurally closer to abstract output than before, but still not fully identical in general.
 
-## Concrete implementation order
+### Reducers are still partly application-specific
 
-1. Add ConcreteExperiment and ConcreteTopologyPlan helpers.
-2. Add ConcretePeerFactory using the existing peer headers.
-3. Add NullNetworkInterface for shadow peers.
-4. Refactor NetworkInterfaceConcrete bootstrap to assign public ids and stop full-mesh neighbor registration.
-5. Refactor concreteSimulation.cpp to use the same experiment file and peer type name as abstract mode.
-6. Update concrete/makefile to compile algorithms from INPUTFILE.
-7. Validate AltBit, StableDataLink, Kademlia, and ExamplePeer end-to-end in concrete mode.
-8. Add transport-level delay/drop/duplicate behavior.
+The reducer framework exists, but only Kademlia has explicit semantic reduction rules so far.
+
+Open work:
+- define reducer rules for PBFT;
+- define reducer rules for Raft;
+- define reducer rules for Bitcoin;
+- define reducer rules for Ethereum;
+- decide when to keep per-peer details only in the detailed file and when to compress them into a single abstract-like compact metric.
+
+### Asynchronous time semantics remain a structural gap
+
+Concrete mode still uses RoundManager::asynchronous() and wall-clock-derived currentRound().
+
+This means:
+- applications may emit many more samples in concrete mode than in abstract mode;
+- even with reducer logic, some compact aggregates will remain denser than their abstract equivalents.
+
+## Short next steps
+
+The highest-value remaining tasks are:
+1. add reducer rules for PBFT and Raft so compact concrete outputs better match abstract time-series shape;
+2. add reducer rules for Bitcoin and Ethereum for fork-structure metrics;
+3. decide whether concrete mode should keep asynchronous time semantics or introduce a stricter round-aligned reporting path for comparison purposes.
 
 ## Validation checklist
 
 - Same INPUTFILE path works in abstract and concrete mode.
-- Same topology.initialPeerType value works in abstract and concrete mode.
-- Concrete neighbors match the topology generated from the experiment JSON.
+- Same topology.initialPeerType works in abstract and concrete mode.
+- Concrete neighbors come from the shared topology plan, not from full-mesh discovery.
 - initParameters sees a full peer vector in concrete mode.
-- No code under quantas/*Peer is modified.
-- No code under quantas/Common/Abstract is modified.
+- No code under quantas/*Peer was modified for the unification work.
+- No code under quantas/Common/Abstract was modified for the unification work.
+- Concrete mode produces both compact and detailed aggregate files.
+- Concrete build now invalidates shared runtime objects when INPUTFILE changes.

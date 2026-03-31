@@ -1,0 +1,7 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5201,
+    "output": "kademlia-concrete-aggregate.json"
+  }
+}

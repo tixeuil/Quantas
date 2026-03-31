@@ -1,0 +1,8 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5304,
+    "output": "raft-concrete-aggregate.json",
+    "detailsOutput": "raft-concrete-aggregate-details.json"
+  }
+}

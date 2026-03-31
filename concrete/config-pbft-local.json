@@ -1,0 +1,8 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5301,
+    "output": "pbft-concrete-aggregate.json",
+    "detailsOutput": "pbft-concrete-aggregate-details.json"
+  }
+}

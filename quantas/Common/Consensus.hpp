@@ -78,7 +78,7 @@ public:
     bool                                    _confirmedZero = false;
 };
 
-void Phase::changePhase(Consensus* c, Phase* s) const {
+inline void Phase::changePhase(Consensus* c, Phase* s) const {
     c->changePhase(s);
 }
 

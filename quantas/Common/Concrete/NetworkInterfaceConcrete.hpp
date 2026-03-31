@@ -8,6 +8,8 @@
 #include <deque>
 #include <vector>
 #include <string>
+#include <chrono>
+#include <thread>
 #include <climits>
 #include <algorithm>
 #include <mutex>
@@ -97,6 +99,7 @@ private:
     int throughput_left = INT_MAX;
     std::deque<Packet> channel_queue;
     std::mutex channel_mtx;
+    static constexpr std::chrono::seconds assignmentTimeout{30};
 
     void configure_distribution(const json& distributionParams) {
         distribution.setParameters(distributionParams);
@@ -148,6 +151,38 @@ private:
         }
     }
 
+    static bool send_all(int sock, const std::string& msg) {
+        size_t totalSent = 0;
+        while (totalSent < msg.size()) {
+            int sent = send(sock,
+                            msg.c_str() + totalSent,
+                            static_cast<int>(msg.size() - totalSent),
+                            0);
+            if (sent <= 0) {
+                return false;
+            }
+            totalSent += static_cast<size_t>(sent);
+        }
+        return true;
+    }
+
+    static std::string read_all(int socketFd) {
+        std::string raw;
+        char buffer[65536];
+        while (true) {
+#ifdef _WIN32
+            int bytes = recv(socketFd, buffer, sizeof(buffer), 0);
+#else
+            int bytes = read(socketFd, buffer, sizeof(buffer));
+#endif
+            if (bytes <= 0) {
+                break;
+            }
+            raw.append(buffer, static_cast<size_t>(bytes));
+        }
+        return raw;
+    }
+
     // Use a thread pool or message dispatch queue so you don’t spawn hundreds of threads.
     void send_json(const std::string& ip, int port, const json& jmsg, bool async = true) {
         auto task = [=]() {
@@ -170,7 +205,7 @@ private:
             }
     
             std::string msg = jmsg.dump();
-            send(sock, msg.c_str(), static_cast<int>(msg.size()), 0);
+                send_all(sock, msg);
     
             #ifdef _WIN32
                 closesocket(sock);
@@ -191,10 +226,19 @@ private:
     }
 
     void wait_for_peer_list() {
+        const auto deadline = std::chrono::steady_clock::now() + assignmentTimeout;
         while (true) {
+            if (shutdown_condition) {
+                throw std::runtime_error("Concrete listener stopped before peer assignment completed.");
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             std::lock_guard<std::mutex> lock(concrete_mtx);
-            if (all_peers.size() == static_cast<size_t>(total_peers) && _publicId != NO_PEER_ID) break;
+            if (all_peers.size() == static_cast<size_t>(total_peers) && _publicId != NO_PEER_ID) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("Timed out while waiting for concrete peer assignment from logger.");
+            }
         }
     }
 
@@ -221,8 +265,28 @@ private:
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(my_port);
 
-        bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
-        listen(server_fd, 8);
+        if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            perror("bind failed");
+            shutdown_condition = true;
+            #ifdef _WIN32
+                closesocket(server_fd);
+            #else
+                close(server_fd);
+            #endif
+            server_fd = -1;
+            return;
+        }
+        if (listen(server_fd, 8) < 0) {
+            perror("listen failed");
+            shutdown_condition = true;
+            #ifdef _WIN32
+                closesocket(server_fd);
+            #else
+                close(server_fd);
+            #endif
+            server_fd = -1;
+            return;
+        }
 
         // std::cout << _publicId << " listening on ip " << my_ip << " port " << my_port << std::endl;
 
@@ -232,28 +296,17 @@ private:
             int new_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
             if (shutdown_condition) break;  // clean exit
             if (new_socket < 0) {
-                perror("accept failed");
-                #ifdef _WIN32
-                    closesocket(new_socket);
-                #else
-                    close(new_socket);
-                #endif
+                if (!shutdown_condition) {
+                    perror("accept failed");
+                }
                 continue;  // skip this loop iteration
             }
 
-            char buffer[2048] = {0};
+            std::string raw_msg = read_all(new_socket);
 
-            #ifdef _WIN32
-                int bytes = recv(new_socket, buffer, sizeof(buffer), 0);
-            #else
-                int bytes = read(new_socket, buffer, sizeof(buffer));
-            #endif
-
-            if (bytes <= 0) {
-                if (bytes == 0) {
+            if (raw_msg.empty()) {
+                if (!shutdown_condition) {
                     std::cerr << "[RECV] Connection closed by peer.\n";
-                } else {
-                    perror("read/recv failed");
                 }
                 #ifdef _WIN32
                     closesocket(new_socket);
@@ -262,8 +315,6 @@ private:
                 #endif
                 continue;
             }
-            std::string raw_msg(buffer, bytes);
-
             try {
                 json msg = json::parse(raw_msg);
                 std::string type = msg.value("type", "");                

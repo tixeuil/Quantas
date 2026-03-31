@@ -1,0 +1,8 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5302,
+    "output": "stabledatalink-concrete-aggregate.json",
+    "detailsOutput": "stabledatalink-concrete-aggregate-details.json"
+  }
+}

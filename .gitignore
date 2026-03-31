@@ -21,6 +21,11 @@
 *.txt
 Debug/
 enc_temp_folder/
+peer_*.log
+*-abstract-aggregate.json
+*-concrete-aggregate.json
+*-concrete-aggregate-details.json
+concrete/.build-context.stamp
 quantas/TrailPeer/*.txt
 quantas/TrailPeer/*.png
 quantas/TrailPeer/*Log.json

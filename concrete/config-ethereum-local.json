@@ -1,0 +1,8 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5306,
+    "output": "ethereum-concrete-aggregate.json",
+    "detailsOutput": "ethereum-concrete-aggregate-details.json"
+  }
+}

@@ -24,6 +24,38 @@ struct LoggerPeerEndpoint {
         };
     }
 };
+
+std::string readSocketPayload(int client) {
+    std::string payload;
+    char buffer[65536];
+    while (true) {
+#ifdef _WIN32
+        int bytes = recv(client, buffer, sizeof(buffer), 0);
+#else
+        int bytes = read(client, buffer, sizeof(buffer));
+#endif
+        if (bytes <= 0) {
+            break;
+        }
+        payload.append(buffer, static_cast<size_t>(bytes));
+    }
+    return payload;
+}
+
+bool sendAll(int sock, const std::string& payload) {
+    size_t totalSent = 0;
+    while (totalSent < payload.size()) {
+        int sent = send(sock,
+                        payload.c_str() + totalSent,
+                        static_cast<int>(payload.size() - totalSent),
+                        0);
+        if (sent <= 0) {
+            return false;
+        }
+        totalSent += static_cast<size_t>(sent);
+    }
+    return true;
+}
 }
 
 int main(int argc, char** argv) {
@@ -63,7 +95,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (listen(server_fd, experiment.initialPeers()) < 0) {
+    if (listen(server_fd, std::max(experiment.initialPeers(), 128)) < 0) {
         std::cerr << "Failed to listen on logger socket.\n";
         return 1;
     }
@@ -83,27 +115,27 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        char buffer[65536] = {0};
-#ifdef _WIN32
-        int bytes = recv(client, buffer, sizeof(buffer), 0);
+        std::string payload = readSocketPayload(client);
+    #ifdef _WIN32
         closesocket(client);
-#else
-        int bytes = read(client, buffer, sizeof(buffer));
+    #else
         close(client);
-#endif
-        if (bytes <= 0) {
+    #endif
+        if (payload.empty()) {
             continue;
         }
 
         try {
-            json message = json::parse(std::string(buffer, bytes));
+            json message = json::parse(payload);
             if (message.value("type", std::string()) == "peer_registration") {
                 registrations.push_back(LoggerPeerEndpoint{
                     NO_PEER_ID,
                     message.value("peerIp", std::string()),
                     message.value("peerPort", -1)});
             }
-        } catch (...) {
+        } catch (const std::exception& ex) {
+            std::cerr << "Logger failed to parse registration payload of size "
+                      << payload.size() << ": " << ex.what() << std::endl;
         }
     }
 
@@ -142,7 +174,7 @@ int main(int argc, char** argv) {
 
         const std::string payload = assignment.dump();
         if (connect(sock, reinterpret_cast<struct sockaddr*>(&peerAddr), sizeof(peerAddr)) == 0) {
-            send(sock, payload.c_str(), static_cast<int>(payload.size()), 0);
+            sendAll(sock, payload);
         }
 
 #ifdef _WIN32
@@ -160,32 +192,38 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        char buffer[65536] = {0};
-#ifdef _WIN32
-        int bytes = recv(client, buffer, sizeof(buffer), 0);
+        std::string payload = readSocketPayload(client);
+    #ifdef _WIN32
         closesocket(client);
-#else
-        int bytes = read(client, buffer, sizeof(buffer));
+    #else
         close(client);
-#endif
-        if (bytes <= 0) {
+    #endif
+        if (payload.empty()) {
             continue;
         }
 
         try {
-            json report = json::parse(std::string(buffer, bytes));
+            json report = json::parse(payload);
             if (report.value("type", std::string()) == "peer_report") {
                 reports.push_back(std::move(report));
             }
-        } catch (...) {
+        } catch (const std::exception& ex) {
+            std::cerr << "Logger failed to parse report payload of size "
+                      << payload.size() << ": " << ex.what() << std::endl;
         }
     }
 
-    json aggregate = ConcreteLoggerProtocol::aggregateReports(reports);
-    aggregate["inputFile"] = experiment.inputFile;
-    aggregate["experimentIndex"] = experimentIndex;
-    aggregate["initialPeerType"] = experiment.initialPeerType();
+    json aggregate = ConcreteLoggerProtocol::aggregateReports(reports,
+                                                             experiment.initialPeerType(),
+                                                             experiment.rounds());
+    json detailed = ConcreteLoggerProtocol::makeDetailedReportBundle(reports);
+    detailed["aggregated"] = aggregate;
+    detailed["inputFile"] = experiment.inputFile;
+    detailed["experimentIndex"] = experimentIndex;
+    detailed["initialPeerType"] = experiment.initialPeerType();
+
     ConcreteLoggerProtocol::writeAggregateFile(bootstrap.loggerOutput, aggregate);
+    ConcreteLoggerProtocol::writeAggregateFile(bootstrap.loggerDetailsOutput, detailed);
 
 #ifdef _WIN32
     closesocket(server_fd);

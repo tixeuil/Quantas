@@ -1,0 +1,7 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5101,
+    "output": "example-concrete-aggregate.json"
+  }
+}

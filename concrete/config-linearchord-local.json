@@ -1,0 +1,8 @@
+{
+  "logger": {
+    "ip": "127.0.0.1",
+    "port": 5303,
+    "output": "linearchord-concrete-aggregate.json",
+    "detailsOutput": "linearchord-concrete-aggregate-details.json"
+  }
+}

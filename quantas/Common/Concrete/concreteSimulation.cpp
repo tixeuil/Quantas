@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     }
 
     ConcreteExperiment experiment = ConcreteExperiment::load(argv[1], experimentIndex);
-    RoundManager::setLastRound(RoundManager::currentRound() + 10000);
+    RoundManager::setLastRound(RoundManager::currentRound() + experiment.rounds());
     
     Peer* peer = ConcretePeerFactory::createActivePeer(experiment.initialPeerType());
     std::vector<Peer*> peer_vector;
@@ -58,16 +58,18 @@ int main(int argc, char** argv) {
         }
 
         peer->initParameters(peer_vector, experiment.parameters());
-        int counter = 9000;
+        int secondsRemainingMarker = static_cast<int>(experiment.rounds()) - 1;
         while(!networkInterface->getShutdownCondition()) {
             if (!peer->isCrashed()) {
                 peer->receive();
                 peer->tryPerformComputation();
             }
             
-            if (int(RoundManager::lastRound()) - int(RoundManager::currentRound()) < counter) {
-                std::cout << 10 - (counter / 1000) << " seconds passed." << std::endl;
-                counter -= 1000;
+            int roundsRemaining = static_cast<int>(RoundManager::lastRound()) - static_cast<int>(RoundManager::currentRound());
+            if (secondsRemainingMarker >= 0 && roundsRemaining <= secondsRemainingMarker) {
+                int elapsed = static_cast<int>(experiment.rounds()) - 1 - secondsRemainingMarker;
+                std::cout << elapsed + 1 << " seconds passed." << std::endl;
+                --secondsRemainingMarker;
             }
 
             if (RoundManager::lastRound() <= RoundManager::currentRound()) {
@@ -89,14 +91,31 @@ int main(int argc, char** argv) {
     size_t peakMemoryKB = getPeakMemoryKB();
     LogWriter::setValue("Peak Memory KB", peakMemoryKB);
 
-    if (auto networkInterface = dynamic_cast<NetworkInterfaceConcrete*>(peer->getNetworkInterface())) {
-        json report = ConcreteLoggerProtocol::makePeerReport(
-            peer->publicId(),
-            experiment.initialPeerType(),
-            experiment.inputFile,
-            experiment.experimentIndex,
-            LogWriter::snapshot());
-        ConcreteLoggerClient::sendReport(networkInterface->getBootstrapConfig(), report);
+    Peer* activePeer = nullptr;
+    for (Peer* peerPtr : peer_vector) {
+        if (peerPtr == nullptr) {
+            continue;
+        }
+        if (dynamic_cast<NetworkInterfaceConcrete*>(peerPtr->getNetworkInterface()) != nullptr) {
+            activePeer = peerPtr;
+            break;
+        }
+    }
+
+    if (activePeer != nullptr) {
+        if (auto networkInterface = dynamic_cast<NetworkInterfaceConcrete*>(activePeer->getNetworkInterface())) {
+            json report = ConcreteLoggerProtocol::makePeerReport(
+                activePeer->publicId(),
+                experiment.initialPeerType(),
+                experiment.inputFile,
+                experiment.experimentIndex,
+                LogWriter::snapshot());
+            bool reportSent = ConcreteLoggerClient::sendReport(networkInterface->getBootstrapConfig(), report);
+            if (!reportSent) {
+                std::cerr << "Failed to send final report for peer "
+                          << activePeer->publicId() << std::endl;
+            }
+        }
     }
 
     LogWriter::print();
